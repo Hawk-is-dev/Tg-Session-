@@ -684,11 +684,18 @@ def string_format_keyboard():
     ])
 
 
+START_FOOTER = (
+    "\n\n_We do not store any of your data — everything stays in your control. "
+    "Facing an issue? Contact the bot owner @izoph._"
+)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
         f"{banner('Session Control Center')}\n"
-        "Pick a tool to begin:",
+        "Pick a tool to begin:"
+        f"{START_FOOTER}",
         reply_markup=main_menu_keyboard(),
         parse_mode="Markdown",
     )

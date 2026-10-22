@@ -43,10 +43,12 @@ from telethon.sessions import StringSession as TelethonStringSession, MemorySess
 from telethon.crypto import AuthKey
 from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
 from telethon.errors import SessionPasswordNeededError as TelethonPasswordNeeded
+from telethon.errors import FloodWaitError as TelethonFloodWait
 
 from pyrogram import Client as PyroClient
 from pyrogram.raw.functions.account import GetAuthorizations, ResetAuthorization
 from pyrogram.errors import SessionPasswordNeeded as PyroPasswordNeeded
+from pyrogram.errors import FloodWait as PyroFloodWait
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("session-control-center")
@@ -64,6 +66,17 @@ WORK_DIR = "work"
 
 MODE_DESTROYER = "destroyer"
 MODE_TERMINATOR = "terminator"
+MODE_INFO = "info"
+
+
+def flood_wait_seconds(e: Exception):
+    """Returns the wait time in seconds if e is a flood-wait error from
+    either library, else None."""
+    if isinstance(e, TelethonFloodWait):
+        return getattr(e, "seconds", None)
+    if isinstance(e, PyroFloodWait):
+        return getattr(e, "value", None)
+    return None
 
 DIVIDER = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
 
@@ -189,6 +202,32 @@ async def do_destroy(client, lib):
     await client.log_out()
 
 
+def _fmt_last_active(value):
+    try:
+        return value.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return str(value) if value else "?"
+
+
+async def do_info(client, lib, label):
+    if lib == "Telethon":
+        auths = await client(GetAuthorizationsRequest())
+    else:
+        auths = await client.invoke(GetAuthorizations())
+    items = auths.authorizations
+
+    lines = [f"👤 {label} — {len(items)} active session(s)"]
+    for a in items:
+        tag = "📍 this session" if getattr(a, "current", False) else "•"
+        device = getattr(a, "device_model", "?")
+        platform = getattr(a, "platform", "?")
+        app = getattr(a, "app_name", "?")
+        country = getattr(a, "country", "?")
+        last_active = _fmt_last_active(getattr(a, "date_active", None))
+        lines.append(f"{tag} — {device} · {platform} · {app} · {country} · last active {last_active}")
+    return "\n".join(lines)
+
+
 async def do_terminate(client, lib):
     if lib == "Telethon":
         auths = await client(GetAuthorizationsRequest())
@@ -221,11 +260,17 @@ async def process_one(display_name, mode, session_path_no_ext=None, session_stri
         client = await get_authorized_telethon_client(session_path_no_ext, session_string)
         lib = "Telethon"
     except Exception as e1:
+        secs = flood_wait_seconds(e1)
+        if secs:
+            return False, f"⏳ Flood wait — {display_name}: Telegram says retry after {secs}s. Skipping for now."
         e_tel = e1
         try:
             client = await get_authorized_pyrogram_client(session_path_no_ext, session_string)
             lib = "Pyrogram"
         except Exception as e2:
+            secs2 = flood_wait_seconds(e2)
+            if secs2:
+                return False, f"⏳ Flood wait — {display_name}: Telegram says retry after {secs2}s. Skipping for now."
             e_pyro = e2
 
     if client is None:
@@ -241,10 +286,16 @@ async def process_one(display_name, mode, session_path_no_ext=None, session_stri
         if mode == MODE_TERMINATOR:
             await do_terminate(client, lib)
             return True, f"Terminated {label}"
+        elif mode == MODE_INFO:
+            text = await do_info(client, lib, label)
+            return True, text
         else:
             await do_destroy(client, lib)
             return True, f"Destroyed {label}"
     except Exception as e:
+        secs = flood_wait_seconds(e)
+        if secs:
+            return False, f"⏳ Flood wait — {display_name}: Telegram says retry after {secs}s. Skipping for now."
         return False, f"❌ Failed — {display_name}: {type(e).__name__}: {e}"
     finally:
         await disconnect_quietly(client, lib)
@@ -303,11 +354,152 @@ async def process_and_report(update: Update, mode, session_files, string_entries
 
 
 # ════════════════════════════════════════════════════════════════
+#  SESSION MERGER — validate multiple .session files, bundle the
+#  valid ones into a single .zip. Original file bytes are kept
+#  untouched (no re-serialization), so nothing can be corrupted.
+# ════════════════════════════════════════════════════════════════
+
+def merge_done_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Done — build merged zip", callback_data="mergedone:yes")],
+    ])
+
+
+async def merge_dir_for(update: Update) -> str:
+    chat_id = update.effective_chat.id
+    d = os.path.join(WORK_DIR, str(chat_id), "merge")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+async def validate_and_add_session(update: Update, context: ContextTypes.DEFAULT_TYPE, path: str, display_name: str):
+    state = context.user_data["merge_state"]
+    path_no_ext = path[:-len(".session")] if path.endswith(".session") else path
+
+    client, lib = None, None
+    e_tel = e_pyro = None
+    try:
+        client = await get_authorized_telethon_client(session_path_no_ext=path_no_ext)
+        lib = "Telethon"
+    except Exception as e1:
+        e_tel = e1
+        try:
+            client = await get_authorized_pyrogram_client(session_path_no_ext=path_no_ext)
+            lib = "Pyrogram"
+        except Exception as e2:
+            e_pyro = e2
+
+    if client is None:
+        await update.message.reply_text(f"⚪ Skipped {display_name} — invalid / already logged out.")
+        return
+
+    try:
+        me = await client.get_me()
+        label = phone_label(me)
+    except Exception:
+        label = display_name
+    finally:
+        await disconnect_quietly(client, lib)
+
+    # Original bytes are kept exactly as-is — only the path is registered.
+    final_name = f"{label.lstrip('+@')}.session"
+    state["items"].append({"path": path, "label": label, "name": final_name})
+    await update.message.reply_text(f"✅ Valid — {label} ({len(state['items'])} collected)")
+
+
+async def handle_merge_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data["merge_state"]
+    if state["dir"] is None:
+        state["dir"] = await merge_dir_for(update)
+
+    doc = update.message.document
+    fname = doc.file_name or "file"
+    local_path = os.path.join(state["dir"], f"{len(state['items'])}_{fname}")
+    tg_file = await doc.get_file()
+    await tg_file.download_to_drive(local_path)
+
+    if fname.lower().endswith(".session"):
+        await validate_and_add_session(update, context, local_path, fname)
+
+    elif fname.lower().endswith(".zip"):
+        extract_dir = local_path + "_x"
+        os.makedirs(extract_dir, exist_ok=True)
+        try:
+            with zipfile.ZipFile(local_path, "r") as z:
+                z.extractall(extract_dir)
+        except zipfile.BadZipFile:
+            await update.message.reply_text("❌ That file isn't a valid zip.")
+            return
+        found = []
+        for dirpath, _, files in os.walk(extract_dir):
+            for f in files:
+                if f.endswith(".session"):
+                    found.append(os.path.join(dirpath, f))
+        if not found:
+            await update.message.reply_text("⚠️ No .session files found inside that zip.")
+            return
+        for p in found:
+            await validate_and_add_session(update, context, p, os.path.basename(p))
+
+    else:
+        await update.message.reply_text("Send a .session file, or a .zip containing .session files.")
+        return
+
+    await update.message.reply_text(
+        f"Send more .session files / .zip(s), or tap Done to merge "
+        f"{len(state['items'])} valid session(s) into one zip.",
+        reply_markup=merge_done_keyboard(),
+    )
+
+
+async def on_merge_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    state = context.user_data.get("merge_state")
+
+    if not state or not state["items"]:
+        await query.edit_message_text("No valid sessions were collected yet.")
+        return
+
+    chat_id = update.effective_chat.id
+    zip_dir = state["dir"] or await merge_dir_for(update)
+    zip_path = os.path.join(zip_dir, "merged_sessions.zip")
+
+    used = {}
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item in state["items"]:
+            name = item["name"]
+            if name in used:
+                used[name] += 1
+                base, ext = os.path.splitext(name)
+                name = f"{base}_{used[name]}{ext}"
+            else:
+                used[name] = 0
+            zf.write(item["path"], arcname=name)
+
+    await query.edit_message_text(f"✅ Merged {len(state['items'])} valid session(s) into one zip.")
+    await context.bot.send_document(
+        chat_id, zip_path, caption=f"📦 {len(state['items'])} merged .session files — keep this private."
+    )
+
+    shutil.rmtree(os.path.join(WORK_DIR, str(chat_id)), ignore_errors=True)
+    context.user_data.pop("merge_state", None)
+
+
+# ════════════════════════════════════════════════════════════════
 #  GENERATE SESSION — String / File / Zip
 # ════════════════════════════════════════════════════════════════
 
 def safe_phone(phone: str) -> str:
     return re.sub(r"[^0-9]", "", phone)
+
+
+def extract_otp_digits(text: str) -> str:
+    """Pulls the digits out of an OTP sent in any obfuscated shape
+    (2.3456 / 23.456 / 2 3 4 5 6 / 234 56 / etc). Telegram auto-invalidates
+    a login code if it's sent as plain bare digits in any chat, so the
+    code must be broken up somehow before sending it here."""
+    return re.sub(r"\D", "", text)
 
 
 async def gen_dir_for(update: Update) -> str:
@@ -394,13 +586,16 @@ async def handle_single_gen_text(update: Update, context: ContextTypes.DEFAULT_T
 
         flow.update({"phone": phone, "client": client, "phone_code_hash": phone_code_hash, "step": "otp"})
         await update.message.reply_text(
-            f"{banner('Step 3 / 3 — Verification Code')}\n📩 Code sent. Enter it here:",
+            f"{banner('Step 3 / 3 — Verification Code')}\n📩 Code sent. Enter it here.\n\n"
+            "⚠️ Telegram auto-invalidates a code sent as *plain bare digits* "
+            "in any chat. Break it up before sending — any of these work:\n"
+            "`2.3456`  `23.456`  `2 3 4 5 6`  `234 56`",
             parse_mode="Markdown",
         )
         return
 
     if step == "otp":
-        otp = text
+        otp = extract_otp_digits(text)
         client = flow["client"]
         phone = flow["phone"]
         try:
@@ -533,27 +728,45 @@ async def zip_send_code_for_current(update: Update, context: ContextTypes.DEFAUL
     api_id, api_hash = flow["api_id"], flow["api_hash"]
     file_path = os.path.join(flow["gen_dir"], safe_phone(phone))
 
+    client = None
     try:
         client = TelethonClient(file_path, api_id, api_hash)
         await client.connect()
         sent = await client.send_code_request(phone)
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ {phone} — could not send code: {type(e).__name__}: {e}. Skipping."
-        )
+        secs = flood_wait_seconds(e)
+        if secs:
+            await update.message.reply_text(
+                f"⏳ {phone} — flood wait, Telegram says retry after {secs}s. Skipping to next number."
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ {phone} — could not send code: {type(e).__name__}: {e}. Skipping."
+            )
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
         await zip_advance(update, context)
         return
 
     flow["client"] = client
     flow["phone_code_hash"] = sent.phone_code_hash
     flow["step"] = "zip_otp"
-    await update.message.reply_text(f"📩 [{i+1}/{len(flow['phones'])}] Code sent to {phone}. Enter it:")
+    await update.message.reply_text(
+        f"📩 [{i+1}/{len(flow['phones'])}] Code sent to {phone}. Enter it — but break it up "
+        "(e.g. `2.3456`, `23.456`, `2 3 4 5 6`), not as plain bare digits, or Telegram "
+        "will auto-invalidate it:",
+        parse_mode="Markdown",
+    )
 
 
-async def zip_handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, otp: str):
+async def zip_handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_otp: str):
     flow = context.user_data["gen_flow"]
     client = flow["client"]
     phone = flow["phones"][flow["index"]]
+    otp = extract_otp_digits(raw_otp)
     try:
         await client.sign_in(phone=phone, code=otp, phone_code_hash=flow["phone_code_hash"])
     except TelethonPasswordNeeded:
@@ -561,7 +774,13 @@ async def zip_handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, otp
         await update.message.reply_text(f"🔒 {phone} has 2-Step Verification. Send the password:")
         return
     except Exception as e:
-        await update.message.reply_text(f"❌ {phone} — {type(e).__name__}: {e}. Skipping.")
+        secs = flood_wait_seconds(e)
+        if secs:
+            await update.message.reply_text(
+                f"⏳ {phone} — flood wait, Telegram says retry after {secs}s. Skipping to next number."
+            )
+        else:
+            await update.message.reply_text(f"❌ {phone} — {type(e).__name__}: {e}. Skipping.")
         try:
             await client.disconnect()
         except Exception:
@@ -578,7 +797,15 @@ async def zip_handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         await client.sign_in(password=password)
     except Exception as e:
-        await update.message.reply_text(f"❌ {phone} — incorrect password / error: {type(e).__name__}: {e}. Skipping.")
+        secs = flood_wait_seconds(e)
+        if secs:
+            await update.message.reply_text(
+                f"⏳ {phone} — flood wait, Telegram says retry after {secs}s. Skipping to next number."
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ {phone} — incorrect password / error: {type(e).__name__}: {e}. Skipping."
+            )
         try:
             await client.disconnect()
         except Exception:
@@ -651,6 +878,20 @@ EXPLAIN = {
         "session on that account — the one you sent stays alive. Useful "
         "for securing an ID instantly, no 24h wait."
     ),
+    "info": (
+        "Send a session (zip / .session / .txt / pasted string).\n"
+        "Read-only — the bot connects, lists every active device/session on "
+        "that account (platform, app, country, last active), then "
+        "disconnects. Nothing is logged out or changed."
+    ),
+    "merger": (
+        "Send multiple .session files (one at a time, or inside .zip files) — "
+        "as many messages as you like. Each one is validated as it arrives; "
+        "invalid or already-logged-out sessions are skipped and reported. "
+        "Tap Done whenever you're ready and every *valid* session collected "
+        "so far is bundled into a single .zip. Original files are kept "
+        "byte-for-byte untouched."
+    ),
     "generate": (
         "Create a brand-new session for an account you control. "
         "Choose an output shape below."
@@ -665,7 +906,16 @@ def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔴 Self Destroyer", callback_data="menu:destroyer")],
         [InlineKeyboardButton("🛡️ Terminator", callback_data="menu:terminator")],
+        [InlineKeyboardButton("🔍 Session Info", callback_data="menu:info")],
+        [InlineKeyboardButton("📦 Session Merger", callback_data="menu:merger")],
         [InlineKeyboardButton("🆕 Generate Session", callback_data="menu:generate")],
+    ])
+
+
+def terminator_confirm_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Yes, proceed", callback_data="confirm:term_yes")],
+        [InlineKeyboardButton("↩️ Cancel", callback_data="confirm:term_no")],
     ])
 
 
@@ -706,19 +956,72 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled. Send /start for the menu.")
 
 
+HELP_TEXT = (
+    f"{banner('Session Control Center — Help')}\n\n"
+    "*🔴 Self Destroyer*\n"
+    f"{EXPLAIN[MODE_DESTROYER]}\n\n"
+    "*🛡️ Terminator*\n"
+    f"{EXPLAIN[MODE_TERMINATOR]}\n\n"
+    "*🔍 Session Info*\n"
+    f"{EXPLAIN[MODE_INFO]}\n\n"
+    "*📦 Session Merger*\n"
+    f"{EXPLAIN['merger']}\n\n"
+    "*🆕 Generate Session*\n"
+    f"{EXPLAIN['generate']}\n"
+    f"  • 🔑 String Session — {EXPLAIN['gen_string']}\n"
+    f"  • 📁 Session File — {EXPLAIN['gen_file']}\n"
+    f"  • 📦 Zip Session — {EXPLAIN['gen_zip']}\n\n"
+    "*⚠️ OTP tip*\n"
+    "Telegram auto-invalidates a login code sent as plain bare digits in "
+    "any chat. Break it up when entering it here, e.g. `2.3456`, `23.456`, "
+    "`2 3 4 5 6` — the bot extracts the digits regardless of how you "
+    "space or punctuate it.\n\n"
+    "*Commands*\n"
+    "/start — open the main menu\n"
+    "/help — this message\n"
+    "/cancel — abort whatever step you're in"
+)
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+
+
+INPUT_HINT = (
+    "Send a .zip, a .session file, a .txt (one string per line), "
+    "or paste a string session as text.\n\nSend /start to change mode."
+)
+
+
 async def on_menu_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     choice = query.data.split(":", 1)[1]
     context.user_data.clear()
 
-    if choice in (MODE_DESTROYER, MODE_TERMINATOR):
-        context.user_data["mode"] = choice
-        title = "Self Destroyer" if choice == MODE_DESTROYER else "Terminator"
+    if choice == MODE_TERMINATOR:
         await query.edit_message_text(
-            f"{banner(title)}\n{EXPLAIN[choice]}\n\n"
-            "Send a .zip, a .session file, a .txt (one string per line), "
-            "or paste a string session as text.\n\nSend /start to change mode.",
+            f"{banner('Terminator')}\n{EXPLAIN[MODE_TERMINATOR]}\n\n"
+            "⚠️ *This cannot be undone.* Every other active session on each "
+            "account you send will be signed out immediately.",
+            reply_markup=terminator_confirm_keyboard(),
+            parse_mode="Markdown",
+        )
+        return
+
+    if choice in (MODE_DESTROYER, MODE_INFO):
+        context.user_data["mode"] = choice
+        title = "Self Destroyer" if choice == MODE_DESTROYER else "Session Info"
+        await query.edit_message_text(
+            f"{banner(title)}\n{EXPLAIN[choice]}\n\n{INPUT_HINT}",
+            parse_mode="Markdown",
+        )
+        return
+
+    if choice == "merger":
+        context.user_data["merge_state"] = {"items": [], "dir": None}
+        await query.edit_message_text(
+            f"{banner('Session Merger')}\n{EXPLAIN['merger']}",
             parse_mode="Markdown",
         )
         return
@@ -727,6 +1030,26 @@ async def on_menu_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"{banner('Generate Session')}\n{EXPLAIN['generate']}",
         reply_markup=generate_submenu_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+async def on_terminator_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+
+    if choice == "term_no":
+        await query.edit_message_text(
+            f"{banner('Session Control Center')}\nPick a tool to begin:{START_FOOTER}",
+            reply_markup=main_menu_keyboard(),
+            parse_mode="Markdown",
+        )
+        return
+
+    context.user_data["mode"] = MODE_TERMINATOR
+    await query.edit_message_text(
+        f"{banner('Terminator')}\n{EXPLAIN[MODE_TERMINATOR]}\n\n{INPUT_HINT}",
         parse_mode="Markdown",
     )
 
@@ -787,6 +1110,10 @@ async def require_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "merge_state" in context.user_data:
+        await handle_merge_document(update, context)
+        return
+
     if "gen_flow" in context.user_data:
         await update.message.reply_text("Finish the current step with text, or /cancel to abort.")
         return
@@ -836,6 +1163,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "merge_state" in context.user_data:
+        await update.message.reply_text("Send a .session file or a .zip containing .session files.")
+        return
+
     flow = context.user_data.get("gen_flow")
     if flow:
         if flow["kind"] == "zip":
@@ -862,7 +1193,10 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CallbackQueryHandler(on_menu_chosen, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(on_terminator_confirm, pattern=r"^confirm:"))
+    app.add_handler(CallbackQueryHandler(on_merge_done, pattern=r"^mergedone:"))
     app.add_handler(CallbackQueryHandler(on_gen_kind_chosen, pattern=r"^gen:"))
     app.add_handler(CallbackQueryHandler(on_string_format_chosen, pattern=r"^genfmt:"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))

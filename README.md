@@ -19,8 +19,14 @@ nothing here reads or acts on anyone else's account.
 | Tool | What it does |
 |---|---|
 | 🔴 **Self Destroyer** | Logs **out** the session you send. Every other session on that account is left untouched. |
-| 🛡️ **Terminator** | Logs **in** with the session you send and terminates every *other* active session on that account, keeping only itself. No 24h wait — this uses Telegram's per-session reset, not the bulk "terminate all" action. |
+| 🛡️ **Terminator** | Logs **in** with the session you send and terminates every *other* active session on that account, keeping only itself. Asks for a one-time confirmation before running, since it can't be undone. No 24h wait — this uses Telegram's per-session reset, not the bulk "terminate all" action. |
+| 🔍 **Session Info** | Read-only. Logs in, lists every active device/session on that account (platform, app, country, last active), then disconnects. Nothing is changed. |
+| 📦 **Session Merger** | Send multiple `.session` files (or `.zip`s of them), one at a time or in batches. Each is validated as it arrives — invalid/logged-out ones are skipped and reported. Tap **Done** anytime to bundle every valid session collected so far into one `.zip`. Original file bytes are never modified. |
 | 🆕 **Generate Session** | Creates a brand-new session for an account you control, in one of three shapes: **String Session**, **Session File**, or **Zip Session**. |
+
+Every result from Self Destroyer / Terminator / Session Info is sent as its
+**own message** the moment that session finishes — not batched — followed
+by a final `All done 👍` summary with success/fail counts.
 
 ---
 
@@ -76,6 +82,36 @@ Accepted inputs for Self Destroyer / Terminator, in any combination:
 - a single `.session` file
 - a `.txt` file with one string session per line
 - a string session pasted directly as a chat message
+
+---
+
+## ⏳ Flood-wait handling
+
+If Telegram rate-limits a particular session (`FloodWaitError` /
+`FloodWait`), the bot doesn't crash or get stuck — it sends a message with
+the required wait time and moves straight on to the next session in the
+batch (or the next number in a Zip Session run).
+
+## 🔢 OTP formatting
+
+Telegram auto-invalidates a login code if it's sent as **plain bare
+digits** in any chat — including to this bot. Break the code up before
+sending it during Generate Session:
+
+```
+2.3456    23.456    2 3 4 5 6    234 56    1_2345
+```
+
+Any shape works — the bot strips everything that isn't a digit and signs
+in with what's left, in order.
+
+## 💬 Commands
+
+| Command | Does |
+|---|---|
+| `/start` | Open the main menu |
+| `/help` | Full explanation of every tool, without needing to tap through menus |
+| `/cancel` | Abort whatever step you're currently in |
 
 ---
 

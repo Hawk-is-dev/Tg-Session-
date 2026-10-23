@@ -22,6 +22,7 @@ once a flow finishes or is cancelled.
 
 import os
 import re
+import time
 import sqlite3
 import zipfile
 import shutil
@@ -39,7 +40,7 @@ from telegram.ext import (
 )
 
 from telethon import TelegramClient as TelethonClient
-from telethon.sessions import StringSession as TelethonStringSession, MemorySession
+from telethon.sessions import StringSession as TelethonStringSession, MemorySession, SQLiteSession
 from telethon.crypto import AuthKey
 from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
 from telethon.errors import SessionPasswordNeededError as TelethonPasswordNeeded
@@ -67,6 +68,8 @@ WORK_DIR = "work"
 MODE_DESTROYER = "destroyer"
 MODE_TERMINATOR = "terminator"
 MODE_INFO = "info"
+MODE_CONV_T2P = "conv_t2p"
+MODE_CONV_P2T = "conv_p2t"
 
 
 def flood_wait_seconds(e: Exception):
@@ -92,7 +95,7 @@ def sc(text: str) -> str:
 
 
 def banner(title: str, body: str = "") -> str:
-    out = f"*{sc(title)}*\n{DIVIDER}"
+    out = f"*{sc(title)}*\n{DIVIDER}\n"
     if body:
         out += f"\n{body}"
     return out
@@ -122,6 +125,237 @@ def manual_telethon_session_from_sqlite(session_file_path: str):
     session.set_dc(dc_id, server_address, port)
     session.auth_key = AuthKey(data=auth_key_bytes)
     return session
+
+
+# ════════════════════════════════════════════════════════════════
+#  SESSION CHANGER — Telethon ⇄ Pyrogram format conversion
+#  Same underlying (dc_id, auth_key, user_id) just rewritten into the
+#  other library's own session format — nothing new is authorized.
+# ════════════════════════════════════════════════════════════════
+
+# Known production DC server IPs (public Telegram infrastructure info,
+# not account-specific) — needed because Pyrogram sessions don't store
+# an IP, only a dc_id; Telethon's file format wants one.
+DC_ADDRESSES = {
+    1: "149.154.175.53",
+    2: "149.154.167.51",
+    3: "149.154.175.100",
+    4: "149.154.167.91",
+    5: "91.108.56.130",
+}
+
+PYRO_SCHEMA = """
+CREATE TABLE sessions (
+    dc_id     INTEGER PRIMARY KEY,
+    api_id    INTEGER,
+    test_mode INTEGER,
+    auth_key  BLOB,
+    date      INTEGER NOT NULL,
+    user_id   INTEGER,
+    is_bot    INTEGER DEFAULT 0
+);
+
+CREATE TABLE peers (
+    id             INTEGER PRIMARY KEY,
+    access_hash    INTEGER,
+    type           INTEGER NOT NULL,
+    username       TEXT,
+    phone_number   TEXT,
+    last_update_on INTEGER NOT NULL DEFAULT (CAST(STRFTIME('%s', 'now') AS INTEGER))
+);
+
+CREATE TABLE version (
+    number INTEGER PRIMARY KEY
+);
+"""
+PYRO_SCHEMA_VERSION = 3
+
+
+def write_pyrogram_session_file(path_no_ext, dc_id, auth_key_bytes, user_id, is_bot=False):
+    session_path = path_no_ext + ".session"
+    if os.path.exists(session_path):
+        os.remove(session_path)
+    conn = sqlite3.connect(session_path)
+    try:
+        conn.executescript(PYRO_SCHEMA)
+        conn.execute("INSERT INTO version VALUES (?)", (PYRO_SCHEMA_VERSION,))
+        conn.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (dc_id, None, 0, auth_key_bytes, int(time.time()), user_id, int(bool(is_bot))),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return session_path
+
+
+def manual_pyrogram_session_read(session_file_path):
+    conn = sqlite3.connect(session_file_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT dc_id, auth_key, user_id, is_bot FROM sessions LIMIT 1")
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise RuntimeError("no row in sessions table")
+    dc_id, auth_key_bytes, user_id, is_bot = row
+    if not auth_key_bytes or len(auth_key_bytes) < 256:
+        raise RuntimeError("auth_key missing or too short")
+    return dc_id, auth_key_bytes, user_id, bool(is_bot)
+
+
+def write_telethon_session_file(path_no_ext, dc_id, auth_key_bytes, user_id=None):
+    session_path = path_no_ext + ".session"
+    if os.path.exists(session_path):
+        os.remove(session_path)
+    sq = SQLiteSession(path_no_ext)
+    server_address = DC_ADDRESSES.get(dc_id, DC_ADDRESSES[2])
+    sq.set_dc(dc_id, server_address, 443)
+    sq.auth_key = AuthKey(data=auth_key_bytes)
+    sq.save()
+    sq.close()
+    return session_path
+
+
+async def convert_telethon_to_pyrogram(display_name, out_dir, session_path_no_ext=None, session_string=None):
+    """Returns (ok, line, file_path_or_None)."""
+    try:
+        client = await get_authorized_telethon_client(session_path_no_ext, session_string)
+    except Exception as e:
+        return False, f"❌ Failed — {display_name}: not a valid/authorized Telethon session ({type(e).__name__})", None
+
+    try:
+        me = await client.get_me()
+        label = phone_label(me)
+        dc_id = client.session.dc_id
+        auth_key_bytes = client.session.auth_key.key
+        user_id = me.id
+        is_bot = bool(getattr(me, "bot", False))
+    except Exception as e:
+        await disconnect_quietly(client, "Telethon")
+        return False, f"❌ Failed — {display_name}: couldn't read session data ({type(e).__name__})", None
+
+    await disconnect_quietly(client, "Telethon")
+
+    out_name = f"pyro_{safe_phone(label)}" if label.startswith("+") else f"pyro_{user_id}"
+    out_path_no_ext = os.path.join(out_dir, out_name)
+    try:
+        session_path = write_pyrogram_session_file(out_path_no_ext, dc_id, auth_key_bytes, user_id, is_bot)
+    except Exception as e:
+        return False, f"❌ Failed — {display_name}: couldn't write Pyrogram file ({type(e).__name__})", None
+
+    # self-verify: make sure the freshly written file actually loads via Pyrogram
+    try:
+        check_client = await get_authorized_pyrogram_client(session_path_no_ext=out_path_no_ext)
+        await disconnect_quietly(check_client, "Pyrogram")
+    except Exception as e:
+        return False, f"❌ Failed — {display_name}: converted file didn't verify ({type(e).__name__})", None
+
+    return True, f"Converted {label} → Pyrogram", session_path
+
+
+async def convert_pyrogram_to_telethon(display_name, out_dir, session_path_no_ext=None, session_string=None):
+    """Returns (ok, line, file_path_or_None)."""
+    try:
+        if session_path_no_ext:
+            dc_id, auth_key_bytes, user_id, is_bot = manual_pyrogram_session_read(session_path_no_ext + ".session")
+            label = f"id:{user_id}" if user_id else display_name
+        else:
+            client = await get_authorized_pyrogram_client(session_string=session_string)
+            try:
+                me = await client.get_me()
+                label = phone_label(me)
+                dc_id = await client.storage.dc_id()
+                auth_key_bytes = await client.storage.auth_key()
+                user_id = await client.storage.user_id()
+            finally:
+                await disconnect_quietly(client, "Pyrogram")
+    except Exception as e:
+        return False, f"❌ Failed — {display_name}: not a valid/authorized Pyrogram session ({type(e).__name__})", None
+
+    out_name = f"telethon_{safe_phone(label)}" if isinstance(label, str) and label.startswith("+") else f"telethon_{user_id}"
+    out_path_no_ext = os.path.join(out_dir, out_name)
+    try:
+        session_path = write_telethon_session_file(out_path_no_ext, dc_id, auth_key_bytes, user_id)
+    except Exception as e:
+        return False, f"❌ Failed — {display_name}: couldn't write Telethon file ({type(e).__name__})", None
+
+    # self-verify: make sure the freshly written file actually loads via Telethon
+    try:
+        check_client = await get_authorized_telethon_client(session_path_no_ext=out_path_no_ext)
+        await disconnect_quietly(check_client, "Telethon")
+    except Exception as e:
+        return False, f"❌ Failed — {display_name}: converted file didn't verify ({type(e).__name__})", None
+
+    return True, f"Converted {label} → Telethon", session_path
+
+
+async def process_and_report_convert(update: Update, direction, session_files, string_entries):
+    total = len(session_files) + len(string_entries)
+    if total == 0:
+        await update.message.reply_text("⚠️ No session files or string sessions found.")
+        return
+
+    await update.message.reply_text(f"🔎 Found {total} session(s). Converting one by one...")
+
+    chat_id = update.effective_chat.id
+    out_dir = os.path.join(WORK_DIR, str(chat_id), "converted")
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    convert_fn = convert_telethon_to_pyrogram if direction == MODE_CONV_T2P else convert_pyrogram_to_telethon
+
+    success_count = 0
+    fail_count = 0
+    idx = 0
+    produced_files = []
+
+    async def run_one(name, **kwargs):
+        nonlocal success_count, fail_count, idx
+        idx += 1
+        ok, line, file_path = await convert_fn(name, out_dir, **kwargs)
+        await update.message.reply_text(f"[{idx}/{total}] {line}")
+        if ok:
+            success_count += 1
+            produced_files.append(file_path)
+        else:
+            fail_count += 1
+        await asyncio.sleep(1)
+
+    for path_no_ext, name in session_files:
+        await run_one(name, session_path_no_ext=path_no_ext)
+
+    for s, name in string_entries:
+        await run_one(name, session_string=s)
+
+    if produced_files:
+        if len(produced_files) == 1:
+            await update.message.reply_document(
+                produced_files[0], caption="📁 Converted session — keep this private."
+            )
+        else:
+            zip_path = os.path.join(out_dir, "converted_sessions.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                used = {}
+                for fp in produced_files:
+                    name = os.path.basename(fp)
+                    if name in used:
+                        used[name] += 1
+                        base, ext = os.path.splitext(name)
+                        name = f"{base}_{used[name]}{ext}"
+                    else:
+                        used[name] = 0
+                    zf.write(fp, arcname=name)
+            await update.message.reply_document(
+                zip_path, caption=f"📦 {len(produced_files)} converted .session file(s) — keep this private."
+            )
+
+    await update.message.reply_text(
+        f"All done 👍\n\nSuccess ({success_count})\nFail ({fail_count})",
+        reply_markup=back_to_menu_keyboard(),
+    )
+    shutil.rmtree(out_dir, ignore_errors=True)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -333,23 +567,27 @@ async def process_and_report(update: Update, mode, session_files, string_entries
 
     success_count = 0
     fail_count = 0
+    idx = 0
 
     for path_no_ext, name in session_files:
+        idx += 1
         ok, line = await process_one(name, mode, session_path_no_ext=path_no_ext)
-        await update.message.reply_text(line)
+        await update.message.reply_text(f"[{idx}/{total}] {line}")
         success_count += 1 if ok else 0
         fail_count += 0 if ok else 1
         await asyncio.sleep(1)
 
     for s, name in string_entries:
+        idx += 1
         ok, line = await process_one(name, mode, session_string=s)
-        await update.message.reply_text(line)
+        await update.message.reply_text(f"[{idx}/{total}] {line}")
         success_count += 1 if ok else 0
         fail_count += 0 if ok else 1
         await asyncio.sleep(1)
 
     await update.message.reply_text(
-        f"All done 👍\n\nSuccess ({success_count})\nFail ({fail_count})"
+        f"All done 👍\n\nSuccess ({success_count})\nFail ({fail_count})",
+        reply_markup=back_to_menu_keyboard(),
     )
 
 
@@ -481,6 +719,7 @@ async def on_merge_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_document(
         chat_id, zip_path, caption=f"📦 {len(state['items'])} merged .session files — keep this private."
     )
+    await context.bot.send_message(chat_id, "All done 👍", reply_markup=back_to_menu_keyboard())
 
     shutil.rmtree(os.path.join(WORK_DIR, str(chat_id)), ignore_errors=True)
     context.user_data.pop("merge_state", None)
@@ -659,6 +898,8 @@ async def finish_single_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         await update.message.reply_document(file_path, caption="📁 Keep this file private.")
+
+    await update.message.reply_text("All done 👍", reply_markup=back_to_menu_keyboard())
 
     chat_id = update.effective_chat.id
     shutil.rmtree(os.path.join(WORK_DIR, str(chat_id)), ignore_errors=True)
@@ -845,7 +1086,7 @@ async def zip_advance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     collected = flow["collected"]
     chat_id = update.effective_chat.id
     if not collected:
-        await update.message.reply_text("⚠️ No sessions were generated.")
+        await update.message.reply_text("⚠️ No sessions were generated.", reply_markup=back_to_menu_keyboard())
     else:
         zip_path = os.path.join(flow["gen_dir"], "sessions.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -857,6 +1098,7 @@ async def zip_advance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_document(
             chat_id, zip_path, caption=f"📦 {len(collected)} .session files — keep this private."
         )
+        await update.message.reply_text("All done 👍", reply_markup=back_to_menu_keyboard())
 
     shutil.rmtree(os.path.join(WORK_DIR, str(chat_id)), ignore_errors=True)
     context.user_data.pop("gen_flow", None)
@@ -868,26 +1110,27 @@ async def zip_advance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 EXPLAIN = {
     "destroyer": (
-        "Send a session (zip / .session / .txt / pasted string).\n"
+        "Send a session (zip / .session / .txt / pasted string).\n\n"
         "That exact session will be logged *out*. Every other session on "
         "that account stays signed in and untouched."
     ),
     "terminator": (
-        "Send a session (zip / .session / .txt / pasted string).\n"
+        "Send a session (zip / .session / .txt / pasted string).\n\n"
         "The bot logs *in* with it and terminates every *other* active "
         "session on that account — the one you sent stays alive. Useful "
         "for securing an ID instantly, no 24h wait."
     ),
     "info": (
-        "Send a session (zip / .session / .txt / pasted string).\n"
+        "Send a session (zip / .session / .txt / pasted string).\n\n"
         "Read-only — the bot connects, lists every active device/session on "
         "that account (platform, app, country, last active), then "
         "disconnects. Nothing is logged out or changed."
     ),
     "merger": (
-        "Send multiple .session files (one at a time, or inside .zip files) — "
-        "as many messages as you like. Each one is validated as it arrives; "
-        "invalid or already-logged-out sessions are skipped and reported. "
+        "Send multiple .session files, one at a time or inside .zip files — "
+        "as many messages as you like.\n\n"
+        "Each one is validated as it arrives; invalid or already-logged-out "
+        "sessions are skipped and reported.\n\n"
         "Tap Done whenever you're ready and every *valid* session collected "
         "so far is bundled into a single .zip. Original files are kept "
         "byte-for-byte untouched."
@@ -899,6 +1142,22 @@ EXPLAIN = {
     "gen_string": "Produces only a copy-paste *string session* — Telethon or Pyrogram format.",
     "gen_file": "Produces a *.session* (sqlite) file for one account — asks for your own API_ID / API_HASH.",
     "gen_zip": "Produces *2 or more* .session files at once, bundled into a single .zip.",
+    "changer": (
+        "Convert a session from one library's format to the other. The "
+        "same login (dc + auth key) is rewritten into the other format's "
+        "*.session* file — nothing is logged in/out or changed on Telegram's "
+        "side. Pick a direction below."
+    ),
+    "conv_t2p": (
+        "Send a Telethon session (zip / .session / .txt / pasted string).\n\n"
+        "Each one is converted into a Pyrogram-compatible *.session* file. "
+        "One session → you get the file directly. Multiple → bundled into a zip."
+    ),
+    "conv_p2t": (
+        "Send a Pyrogram session (zip / .session / .txt / pasted string).\n\n"
+        "Each one is converted into a Telethon-compatible *.session* file. "
+        "One session → you get the file directly. Multiple → bundled into a zip."
+    ),
 }
 
 
@@ -909,7 +1168,25 @@ def main_menu_keyboard():
         [InlineKeyboardButton("🔍 Session Info", callback_data="menu:info")],
         [InlineKeyboardButton("📦 Session Merger", callback_data="menu:merger")],
         [InlineKeyboardButton("🆕 Generate Session", callback_data="menu:generate")],
+        [InlineKeyboardButton("🔄 Session Changer", callback_data="menu:changer")],
     ])
+
+
+def back_to_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏠 Back to Menu", callback_data="backmenu")],
+    ])
+
+
+async def on_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    await query.edit_message_text(
+        f"{banner('Session Control Center')}\nPick a tool to begin:{START_FOOTER}",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
 
 
 def terminator_confirm_keyboard():
@@ -931,6 +1208,13 @@ def string_format_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔸 Telethon String", callback_data="genfmt:telethon")],
         [InlineKeyboardButton("🔹 Pyrogram String", callback_data="genfmt:pyrogram")],
+    ])
+
+
+def changer_direction_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Telethon ➡️ Pyrogram", callback_data="convdir:t2p")],
+        [InlineKeyboardButton("Pyrogram ➡️ Telethon", callback_data="convdir:p2t")],
     ])
 
 
@@ -957,7 +1241,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 HELP_TEXT = (
-    f"{banner('Session Control Center — Help')}\n\n"
+    f"{banner('Session Control Center — Help')}\n"
     "*🔴 Self Destroyer*\n"
     f"{EXPLAIN[MODE_DESTROYER]}\n\n"
     "*🛡️ Terminator*\n"
@@ -971,6 +1255,10 @@ HELP_TEXT = (
     f"  • 🔑 String Session — {EXPLAIN['gen_string']}\n"
     f"  • 📁 Session File — {EXPLAIN['gen_file']}\n"
     f"  • 📦 Zip Session — {EXPLAIN['gen_zip']}\n\n"
+    "*🔄 Session Changer*\n"
+    f"{EXPLAIN['changer']}\n"
+    f"  • Telethon ➡️ Pyrogram — {EXPLAIN['conv_t2p']}\n"
+    f"  • Pyrogram ➡️ Telethon — {EXPLAIN['conv_p2t']}\n\n"
     "*⚠️ OTP tip*\n"
     "Telegram auto-invalidates a login code sent as plain bare digits in "
     "any chat. Break it up when entering it here, e.g. `2.3456`, `23.456`, "
@@ -1022,6 +1310,14 @@ async def on_menu_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["merge_state"] = {"items": [], "dir": None}
         await query.edit_message_text(
             f"{banner('Session Merger')}\n{EXPLAIN['merger']}",
+            parse_mode="Markdown",
+        )
+        return
+
+    if choice == "changer":
+        await query.edit_message_text(
+            f"{banner('Session Changer')}\n{EXPLAIN['changer']}",
+            reply_markup=changer_direction_keyboard(),
             parse_mode="Markdown",
         )
         return
@@ -1084,6 +1380,20 @@ async def on_gen_kind_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="Markdown",
     )
     await gen_ask_api_id(query.message.reply_text)
+
+
+async def on_changer_direction_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    direction = query.data.split(":", 1)[1]  # t2p | p2t
+    mode = MODE_CONV_T2P if direction == "t2p" else MODE_CONV_P2T
+    context.user_data.clear()
+    context.user_data["mode"] = mode
+    title = "Telethon ➡️ Pyrogram" if mode == MODE_CONV_T2P else "Pyrogram ➡️ Telethon"
+    await query.edit_message_text(
+        f"{banner(title)}\n{EXPLAIN[mode]}\n\n{INPUT_HINT}",
+        parse_mode="Markdown",
+    )
 
 
 async def on_string_format_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1158,7 +1468,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await process_and_report(update, mode, session_files, string_entries)
+    if mode in (MODE_CONV_T2P, MODE_CONV_P2T):
+        await process_and_report_convert(update, mode, session_files, string_entries)
+    else:
+        await process_and_report(update, mode, session_files, string_entries)
     shutil.rmtree(session_work_dir, ignore_errors=True)
 
 
@@ -1184,7 +1497,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not lines:
         return
     string_entries = [(line, f"pasted line {i+1}") for i, line in enumerate(lines)]
-    await process_and_report(update, mode, [], string_entries)
+    if mode in (MODE_CONV_T2P, MODE_CONV_P2T):
+        await process_and_report_convert(update, mode, [], string_entries)
+    else:
+        await process_and_report(update, mode, [], string_entries)
 
 
 def main():
@@ -1197,8 +1513,10 @@ def main():
     app.add_handler(CallbackQueryHandler(on_menu_chosen, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(on_terminator_confirm, pattern=r"^confirm:"))
     app.add_handler(CallbackQueryHandler(on_merge_done, pattern=r"^mergedone:"))
+    app.add_handler(CallbackQueryHandler(on_back_to_menu, pattern=r"^backmenu$"))
     app.add_handler(CallbackQueryHandler(on_gen_kind_chosen, pattern=r"^gen:"))
     app.add_handler(CallbackQueryHandler(on_string_format_chosen, pattern=r"^genfmt:"))
+    app.add_handler(CallbackQueryHandler(on_changer_direction_chosen, pattern=r"^convdir:"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 

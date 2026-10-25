@@ -29,7 +29,7 @@ import shutil
 import logging
 import asyncio
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -768,9 +768,17 @@ async def gen_ask_api_hash(reply_fn):
     await reply_fn("Now send your *API_HASH*:", parse_mode="Markdown")
 
 
+OTP_TIP = (
+    "⚠️ *Tip:* Telegram auto-invalidates a code sent as plain bare digits "
+    "in any chat. When your code arrives, break it up before sending it here — "
+    "e.g. `2.3456`, `23.456`, `2 3 4 5 6`."
+)
+
+
 async def gen_ask_phone(reply_fn, label="Step 2 / 3 — Phone Number"):
     await reply_fn(
-        f"{banner(label)}\nSend the phone number with country code, e.g. `+919876543210`:",
+        f"{banner(label)}\nSend the phone number with country code, e.g. `+919876543210`.\n\n"
+        f"{OTP_TIP}",
         parse_mode="Markdown",
     )
 
@@ -825,10 +833,7 @@ async def handle_single_gen_text(update: Update, context: ContextTypes.DEFAULT_T
 
         flow.update({"phone": phone, "client": client, "phone_code_hash": phone_code_hash, "step": "otp"})
         await update.message.reply_text(
-            f"{banner('Step 3 / 3 — Verification Code')}\n📩 Code sent. Enter it here.\n\n"
-            "⚠️ Telegram auto-invalidates a code sent as *plain bare digits* "
-            "in any chat. Break it up before sending — any of these work:\n"
-            "`2.3456`  `23.456`  `2 3 4 5 6`  `234 56`",
+            f"{banner('Step 3 / 3 — Verification Code')}\n📩 Code sent. Enter it here.",
             parse_mode="Markdown",
         )
         return
@@ -948,7 +953,9 @@ async def handle_zip_gen_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         flow["gen_dir"] = gen_dir
         await update.message.reply_text(
             f"{banner('Step 3 / 3 — Sequential Login')}\n"
-            f"Queued {len(numbers)} numbers. Processing in the order sent."
+            f"Queued {len(numbers)} numbers. Processing in the order sent.\n\n"
+            f"{OTP_TIP}",
+            parse_mode="Markdown",
         )
         await zip_send_code_for_current(update, context)
         return
@@ -995,12 +1002,7 @@ async def zip_send_code_for_current(update: Update, context: ContextTypes.DEFAUL
     flow["client"] = client
     flow["phone_code_hash"] = sent.phone_code_hash
     flow["step"] = "zip_otp"
-    await update.message.reply_text(
-        f"📩 [{i+1}/{len(flow['phones'])}] Code sent to {phone}. Enter it — but break it up "
-        "(e.g. `2.3456`, `23.456`, `2 3 4 5 6`), not as plain bare digits, or Telegram "
-        "will auto-invalidate it:",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text(f"📩 [{i+1}/{len(flow['phones'])}] Code sent to {phone}. Enter it:")
 
 
 async def zip_handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_otp: str):
@@ -1184,6 +1186,12 @@ def back_to_menu_keyboard():
     ])
 
 
+def back_row(callback_data="backmenu", label="⬅️ Back"):
+    """A single Back button row, to append under a screen's own buttons
+    (or use alone for screens with no other buttons)."""
+    return [InlineKeyboardButton(label, callback_data=callback_data)]
+
+
 async def on_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1218,6 +1226,7 @@ def generate_submenu_keyboard():
             InlineKeyboardButton("📁 File", callback_data="gen:file"),
         ],
         [InlineKeyboardButton("📦 Zip (multi)", callback_data="gen:zip")],
+        back_row("backmenu"),
     ])
 
 
@@ -1227,6 +1236,7 @@ def string_format_keyboard():
             InlineKeyboardButton("🔸 Telethon", callback_data="genfmt:telethon"),
             InlineKeyboardButton("🔹 Pyrogram", callback_data="genfmt:pyrogram"),
         ],
+        back_row("gen:back"),
     ])
 
 
@@ -1234,6 +1244,7 @@ def changer_direction_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Telethon ➡️ Pyrogram", callback_data="convdir:t2p")],
         [InlineKeyboardButton("Pyrogram ➡️ Telethon", callback_data="convdir:p2t")],
+        back_row("backmenu"),
     ])
 
 
@@ -1332,6 +1343,7 @@ async def on_menu_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = "Self Destroyer" if choice == MODE_DESTROYER else "Session Info"
         await query.edit_message_text(
             f"{banner(title)}\n{EXPLAIN[choice]}\n\n{INPUT_HINT}",
+            reply_markup=InlineKeyboardMarkup([back_row("backmenu")]),
             parse_mode="Markdown",
         )
         return
@@ -1340,6 +1352,7 @@ async def on_menu_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["merge_state"] = {"items": [], "dir": None}
         await query.edit_message_text(
             f"{banner('Session Merger')}\n{EXPLAIN['merger']}",
+            reply_markup=InlineKeyboardMarkup([back_row("backmenu")]),
             parse_mode="Markdown",
         )
         return
@@ -1376,6 +1389,7 @@ async def on_terminator_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["mode"] = MODE_TERMINATOR
     await query.edit_message_text(
         f"{banner('Terminator')}\n{EXPLAIN[MODE_TERMINATOR]}\n\n{INPUT_HINT}",
+        reply_markup=InlineKeyboardMarkup([back_row("backmenu")]),
         parse_mode="Markdown",
     )
 
@@ -1383,7 +1397,16 @@ async def on_terminator_confirm(update: Update, context: ContextTypes.DEFAULT_TY
 async def on_gen_kind_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    kind = query.data.split(":", 1)[1]  # string | file | zip
+    kind = query.data.split(":", 1)[1]  # string | file | zip | back
+
+    if kind == "back":
+        context.user_data.clear()
+        await query.edit_message_text(
+            f"{banner('Generate Session')}\n{EXPLAIN['generate']}",
+            reply_markup=generate_submenu_keyboard(),
+            parse_mode="Markdown",
+        )
+        return
 
     if kind == "string":
         context.user_data["gen_flow"] = {"kind": "string"}
@@ -1415,13 +1438,24 @@ async def on_gen_kind_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def on_changer_direction_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    direction = query.data.split(":", 1)[1]  # t2p | p2t
+    direction = query.data.split(":", 1)[1]  # t2p | p2t | back
+
+    if direction == "back":
+        context.user_data.clear()
+        await query.edit_message_text(
+            f"{banner('Session Changer')}\n{EXPLAIN['changer']}",
+            reply_markup=changer_direction_keyboard(),
+            parse_mode="Markdown",
+        )
+        return
+
     mode = MODE_CONV_T2P if direction == "t2p" else MODE_CONV_P2T
     context.user_data.clear()
     context.user_data["mode"] = mode
     title = "Telethon ➡️ Pyrogram" if mode == MODE_CONV_T2P else "Pyrogram ➡️ Telethon"
     await query.edit_message_text(
         f"{banner(title)}\n{EXPLAIN[mode]}\n\n{INPUT_HINT}",
+        reply_markup=InlineKeyboardMarkup([back_row("convdir:back")]),
         parse_mode="Markdown",
     )
 
@@ -1533,9 +1567,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await process_and_report(update, mode, [], string_entries)
 
 
+async def post_init(app):
+    await app.bot.set_my_commands([
+        BotCommand("start", "Open the main menu"),
+        BotCommand("help", "How each tool works"),
+        BotCommand("cancel", "Abort the current step"),
+    ])
+
+
 def main():
     os.makedirs(WORK_DIR, exist_ok=True)
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel_cmd))

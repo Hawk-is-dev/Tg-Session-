@@ -1163,12 +1163,18 @@ EXPLAIN = {
 
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔴 Self Destroyer", callback_data="menu:destroyer")],
-        [InlineKeyboardButton("🛡️ Terminator", callback_data="menu:terminator")],
-        [InlineKeyboardButton("🔍 Session Info", callback_data="menu:info")],
-        [InlineKeyboardButton("📦 Session Merger", callback_data="menu:merger")],
-        [InlineKeyboardButton("🆕 Generate Session", callback_data="menu:generate")],
-        [InlineKeyboardButton("🔄 Session Changer", callback_data="menu:changer")],
+        [
+            InlineKeyboardButton("🔴 Self Destroyer", callback_data="menu:destroyer"),
+            InlineKeyboardButton("🛡️ Terminator", callback_data="menu:terminator"),
+        ],
+        [
+            InlineKeyboardButton("🔍 Session Info", callback_data="menu:info"),
+            InlineKeyboardButton("📦 Merger", callback_data="menu:merger"),
+        ],
+        [
+            InlineKeyboardButton("🆕 Generate", callback_data="menu:generate"),
+            InlineKeyboardButton("🔄 Changer", callback_data="menu:changer"),
+        ],
     ])
 
 
@@ -1183,7 +1189,16 @@ async def on_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     context.user_data.clear()
     await query.edit_message_text(
-        f"{banner('Session Control Center')}\nPick a tool to begin:{START_FOOTER}",
+        f"{banner('Session Control Center')}\n"
+        f"*{sc('Tools')}*\n"
+        "🔴 Self Destroyer — log yourself out\n"
+        "🛡️ Terminator — end every other active session\n"
+        "🔍 Session Info — list active devices\n"
+        "📦 Merger — combine sessions into one zip\n"
+        "🆕 Generate — create a new session\n"
+        "🔄 Changer — convert Telethon ⇄ Pyrogram\n\n"
+        "Choose a tool below."
+        f"{START_FOOTER}",
         reply_markup=main_menu_keyboard(),
         parse_mode="Markdown",
     )
@@ -1198,16 +1213,20 @@ def terminator_confirm_keyboard():
 
 def generate_submenu_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔑 String Session", callback_data="gen:string")],
-        [InlineKeyboardButton("📁 Session File", callback_data="gen:file")],
-        [InlineKeyboardButton("📦 Zip Session", callback_data="gen:zip")],
+        [
+            InlineKeyboardButton("🔑 String", callback_data="gen:string"),
+            InlineKeyboardButton("📁 File", callback_data="gen:file"),
+        ],
+        [InlineKeyboardButton("📦 Zip (multi)", callback_data="gen:zip")],
     ])
 
 
 def string_format_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔸 Telethon String", callback_data="genfmt:telethon")],
-        [InlineKeyboardButton("🔹 Pyrogram String", callback_data="genfmt:pyrogram")],
+        [
+            InlineKeyboardButton("🔸 Telethon", callback_data="genfmt:telethon"),
+            InlineKeyboardButton("🔹 Pyrogram", callback_data="genfmt:pyrogram"),
+        ],
     ])
 
 
@@ -1226,9 +1245,20 @@ START_FOOTER = (
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    first_name = update.effective_user.first_name or "there"
     await update.message.reply_text(
         f"{banner('Session Control Center')}\n"
-        "Pick a tool to begin:"
+        f"Welcome, {first_name}.\n"
+        "This bot manages Telegram sessions you already control — "
+        "logout, terminate, inspect, merge, generate, or convert them.\n\n"
+        f"*{sc('Tools')}*\n"
+        "🔴 Self Destroyer — log yourself out\n"
+        "🛡️ Terminator — end every other active session\n"
+        "🔍 Session Info — list active devices\n"
+        "📦 Merger — combine sessions into one zip\n"
+        "🆕 Generate — create a new session\n"
+        "🔄 Changer — convert Telethon ⇄ Pyrogram\n\n"
+        "Choose a tool below."
         f"{START_FOOTER}",
         reply_markup=main_menu_keyboard(),
         parse_mode="Markdown",

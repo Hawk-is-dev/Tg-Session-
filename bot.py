@@ -29,7 +29,7 @@ import shutil
 import logging
 import asyncio
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, Message, CallbackQuery, Bot
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -90,7 +90,10 @@ _SMALL_CAPS = str.maketrans(
 
 
 def sc(text: str) -> str:
-    """Render a heading in small caps for a sharper, premium look."""
+    """Convert text to small caps. Safe to call on text that's already
+    been converted — only plain ASCII a-z gets touched, so it's idempotent
+    and safe to apply broadly (digits, emoji, Markdown syntax, and already
+    -converted small-caps characters all pass through untouched)."""
     return text.lower().translate(_SMALL_CAPS)
 
 
@@ -99,6 +102,58 @@ def banner(title: str, body: str = "") -> str:
     if body:
         out += f"\n{body}"
     return out
+
+
+_PROTECTED_RE = re.compile(r"(@\w+|/[a-zA-Z_]+|https?://\S+)")
+
+
+def sc_safe(text: str) -> str:
+    """Like sc(), but leaves @mentions, /commands, and URLs untouched so
+    they stay tappable/clickable in Telegram."""
+    parts = _PROTECTED_RE.split(text)
+    return "".join(p if _PROTECTED_RE.fullmatch(p) else sc(p) for p in parts)
+
+
+# Patch every outgoing text/caption so the WHOLE bot — not just headings —
+# renders in small caps, without editing every single call site. sc() only
+# ever touches plain ASCII a-z, so it's safe to run on text that may already
+# be partly converted, on URLs, on digits, on Markdown syntax, etc.
+def _scify(value):
+    return sc_safe(value) if isinstance(value, str) else value
+
+
+_orig_msg_reply_text = Message.reply_text
+_orig_msg_reply_document = Message.reply_document
+_orig_cbq_edit_message_text = CallbackQuery.edit_message_text
+_orig_bot_send_message = Bot.send_message
+_orig_bot_send_document = Bot.send_document
+
+
+async def _patched_msg_reply_text(self, text=None, *args, **kwargs):
+    return await _orig_msg_reply_text(self, _scify(text), *args, **kwargs)
+
+
+async def _patched_msg_reply_document(self, *args, caption=None, **kwargs):
+    return await _orig_msg_reply_document(self, *args, caption=_scify(caption), **kwargs)
+
+
+async def _patched_cbq_edit_message_text(self, text=None, *args, **kwargs):
+    return await _orig_cbq_edit_message_text(self, _scify(text), *args, **kwargs)
+
+
+async def _patched_bot_send_message(self, chat_id, text=None, *args, **kwargs):
+    return await _orig_bot_send_message(self, chat_id, _scify(text), *args, **kwargs)
+
+
+async def _patched_bot_send_document(self, chat_id, *args, caption=None, **kwargs):
+    return await _orig_bot_send_document(self, chat_id, *args, caption=_scify(caption), **kwargs)
+
+
+Message.reply_text = _patched_msg_reply_text
+Message.reply_document = _patched_msg_reply_document
+CallbackQuery.edit_message_text = _patched_cbq_edit_message_text
+Bot.send_message = _patched_bot_send_message
+Bot.send_document = _patched_bot_send_document
 
 
 # ════════════════════════════════════════════════════════════════
@@ -768,7 +823,7 @@ async def gen_ask_api_hash(reply_fn):
     await reply_fn("Now send your *API_HASH*:", parse_mode="Markdown")
 
 
-OTP_TIP = (
+OTP_TIP = sc(
     "⚠️ *Tip:* Telegram auto-invalidates a code sent as plain bare digits "
     "in any chat. When your code arrives, break it up before sending it here — "
     "e.g. `2.3456`, `23.456`, `2 3 4 5 6`."
@@ -1161,6 +1216,7 @@ EXPLAIN = {
         "One session → you get the file directly. Multiple → bundled into a zip."
     ),
 }
+EXPLAIN = {k: sc(v) for k, v in EXPLAIN.items()}
 
 
 def main_menu_keyboard():
@@ -1199,13 +1255,8 @@ async def on_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"{banner('Session Control Center')}\n"
         f"*{sc('Tools')}*\n"
-        "🔴 Self Destroyer — log yourself out\n"
-        "🛡️ Terminator — end every other active session\n"
-        "🔍 Session Info — list active devices\n"
-        "📦 Merger — combine sessions into one zip\n"
-        "🆕 Generate — create a new session\n"
-        "🔄 Changer — convert Telethon ⇄ Pyrogram\n\n"
-        "Choose a tool below."
+        f"{TOOLS_LIST}\n\n"
+        f"{sc('Choose a tool below.')}"
         f"{START_FOOTER}",
         reply_markup=main_menu_keyboard(),
         parse_mode="Markdown",
@@ -1248,9 +1299,18 @@ def changer_direction_keyboard():
     ])
 
 
+TOOLS_LIST = sc(
+    "🔴 Self Destroyer — log yourself out\n"
+    "🛡️ Terminator — end every other active session\n"
+    "🔍 Session Info — list active devices\n"
+    "📦 Merger — combine sessions into one zip\n"
+    "🆕 Generate — create a new session\n"
+    "🔄 Changer — convert Telethon ⇄ Pyrogram"
+)
+
 START_FOOTER = (
-    "\n\n_We do not store any of your data — everything stays in your control. "
-    "Facing an issue? Contact the bot owner @izoph._"
+    f"\n\n_{sc('We do not store any of your data — everything stays in your control. ')}"
+    f"{sc('Facing an issue? Contact the bot owner')} @izoph._"
 )
 
 
@@ -1259,17 +1319,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     first_name = update.effective_user.first_name or "there"
     await update.message.reply_text(
         f"{banner('Session Control Center')}\n"
-        f"Welcome, {first_name}.\n"
-        "This bot manages Telegram sessions you already control — "
-        "logout, terminate, inspect, merge, generate, or convert them.\n\n"
+        f"{sc(f'Welcome, {first_name}.')}\n"
+        f"{sc('This bot manages Telegram sessions you already control —')} "
+        f"{sc('logout, terminate, inspect, merge, generate, or convert them.')}\n\n"
         f"*{sc('Tools')}*\n"
-        "🔴 Self Destroyer — log yourself out\n"
-        "🛡️ Terminator — end every other active session\n"
-        "🔍 Session Info — list active devices\n"
-        "📦 Merger — combine sessions into one zip\n"
-        "🆕 Generate — create a new session\n"
-        "🔄 Changer — convert Telethon ⇄ Pyrogram\n\n"
-        "Choose a tool below."
+        f"{TOOLS_LIST}\n\n"
+        f"{sc('Choose a tool below.')}"
         f"{START_FOOTER}",
         reply_markup=main_menu_keyboard(),
         parse_mode="Markdown",
@@ -1283,32 +1338,29 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 HELP_TEXT = (
     f"{banner('Session Control Center — Help')}\n"
-    "*🔴 Self Destroyer*\n"
+    f"*🔴 {sc('Self Destroyer')}*\n"
     f"{EXPLAIN[MODE_DESTROYER]}\n\n"
-    "*🛡️ Terminator*\n"
+    f"*🛡️ {sc('Terminator')}*\n"
     f"{EXPLAIN[MODE_TERMINATOR]}\n\n"
-    "*🔍 Session Info*\n"
+    f"*🔍 {sc('Session Info')}*\n"
     f"{EXPLAIN[MODE_INFO]}\n\n"
-    "*📦 Session Merger*\n"
+    f"*📦 {sc('Session Merger')}*\n"
     f"{EXPLAIN['merger']}\n\n"
-    "*🆕 Generate Session*\n"
+    f"*🆕 {sc('Generate Session')}*\n"
     f"{EXPLAIN['generate']}\n"
-    f"  • 🔑 String Session — {EXPLAIN['gen_string']}\n"
-    f"  • 📁 Session File — {EXPLAIN['gen_file']}\n"
-    f"  • 📦 Zip Session — {EXPLAIN['gen_zip']}\n\n"
-    "*🔄 Session Changer*\n"
+    f"  • 🔑 {sc('String Session')} — {EXPLAIN['gen_string']}\n"
+    f"  • 📁 {sc('Session File')} — {EXPLAIN['gen_file']}\n"
+    f"  • 📦 {sc('Zip Session')} — {EXPLAIN['gen_zip']}\n\n"
+    f"*🔄 {sc('Session Changer')}*\n"
     f"{EXPLAIN['changer']}\n"
-    f"  • Telethon ➡️ Pyrogram — {EXPLAIN['conv_t2p']}\n"
-    f"  • Pyrogram ➡️ Telethon — {EXPLAIN['conv_p2t']}\n\n"
-    "*⚠️ OTP tip*\n"
-    "Telegram auto-invalidates a login code sent as plain bare digits in "
-    "any chat. Break it up when entering it here, e.g. `2.3456`, `23.456`, "
-    "`2 3 4 5 6` — the bot extracts the digits regardless of how you "
-    "space or punctuate it.\n\n"
-    "*Commands*\n"
-    "/start — open the main menu\n"
-    "/help — this message\n"
-    "/cancel — abort whatever step you're in"
+    f"  • {sc('Telethon ➡️ Pyrogram')} — {EXPLAIN['conv_t2p']}\n"
+    f"  • {sc('Pyrogram ➡️ Telethon')} — {EXPLAIN['conv_p2t']}\n\n"
+    f"*⚠️ {sc('OTP tip')}*\n"
+    f"{OTP_TIP}\n\n"
+    f"*{sc('Commands')}*\n"
+    f"/start — {sc('open the main menu')}\n"
+    f"/help — {sc('this message')}\n"
+    f"/cancel — {sc('abort whatever step you are in')}"
 )
 
 
@@ -1317,8 +1369,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 INPUT_HINT = (
-    "Send a .zip, a .session file, a .txt (one string per line), "
-    "or paste a string session as text.\n\nSend /start to change mode."
+    f"{sc('Send a .zip, a .session file, a .txt (one string per line),')} "
+    f"{sc('or paste a string session as text.')}\n\n"
+    f"{sc('Send')} /start {sc('to change mode.')}"
 )
 
 

@@ -23,6 +23,9 @@ once a flow finishes or is cancelled.
 import os
 import re
 import time
+import json
+import base64
+import hashlib
 import sqlite3
 import zipfile
 import shutil
@@ -70,6 +73,8 @@ MODE_TERMINATOR = "terminator"
 MODE_INFO = "info"
 MODE_CONV_T2P = "conv_t2p"
 MODE_CONV_P2T = "conv_p2t"
+MODE_CONV_T2G = "conv_t2g"
+MODE_CONV_P2G = "conv_p2g"
 
 
 def flood_wait_seconds(e: Exception):
@@ -104,7 +109,7 @@ def banner(title: str, body: str = "") -> str:
     return out
 
 
-_PROTECTED_RE = re.compile(r"(@\w+|/[a-zA-Z_]+|https?://\S+)")
+_PROTECTED_RE = re.compile(r"(@\w+|/[a-zA-Z_]+|https?://\S+|`[^`]*`)")
 
 
 def sc_safe(text: str) -> str:
@@ -273,6 +278,102 @@ def write_telethon_session_file(path_no_ext, dc_id, auth_key_bytes, user_id=None
     return session_path
 
 
+# Gogram's modern string-session format (reverse-engineered from the
+# open-source github.com/mtgo-labs/session-converter implementation):
+#   "1BvE" + base64_urlsafe_no_padding(JSON({key, hash, dc_id, ip_addr, app_id}))
+# where key/hash are themselves base64-STANDARD strings inside the JSON
+# (Go's encoding/json marshals []byte fields as base64.StdEncoding).
+GOGRAM_PREFIX = "1BvE"
+
+
+def encode_gogram_session_string(dc_id, auth_key_bytes, app_id=0):
+    auth_key_hash = hashlib.sha1(auth_key_bytes).digest()[:8]
+    obj = {
+        "key": base64.b64encode(auth_key_bytes).decode(),
+        "hash": base64.b64encode(auth_key_hash).decode(),
+        "dc_id": dc_id,
+        "ip_addr": DC_ADDRESSES.get(dc_id, DC_ADDRESSES[2]),
+        "app_id": app_id,
+    }
+    data = json.dumps(obj, separators=(",", ":")).encode()
+    return GOGRAM_PREFIX + base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def self_check_gogram_string(s):
+    """Structural round-trip check (can't runtime-test against real gogram
+    since it's a Go library) — confirms the string decodes back to a
+    256-byte key with the right dc_id, catching encoding bugs on our end."""
+    if not s.startswith(GOGRAM_PREFIX):
+        raise ValueError("missing prefix")
+    padded = s[len(GOGRAM_PREFIX):]
+    padded += "=" * (-len(padded) % 4)
+    data = base64.urlsafe_b64decode(padded)
+    obj = json.loads(data)
+    key = base64.b64decode(obj["key"])
+    if len(key) != 256:
+        raise ValueError(f"auth key is {len(key)} bytes, expected 256")
+    return obj["dc_id"]
+
+
+async def convert_telethon_to_gogram(display_name, out_dir, session_path_no_ext=None, session_string=None):
+    """Returns (ok, line, None) — gogram output is a string, not a file."""
+    try:
+        client = await get_authorized_telethon_client(session_path_no_ext, session_string)
+    except Exception as e:
+        return False, f"❌ Failed — {display_name}: not a valid/authorized Telethon session ({type(e).__name__})", None
+
+    try:
+        me = await client.get_me()
+        label = phone_label(me)
+        dc_id = client.session.dc_id
+        auth_key_bytes = client.session.auth_key.key
+    except Exception as e:
+        await disconnect_quietly(client, "Telethon")
+        return False, f"❌ Failed — {display_name}: couldn't read session data ({type(e).__name__})", None
+
+    await disconnect_quietly(client, "Telethon")
+
+    try:
+        gstring = encode_gogram_session_string(dc_id, auth_key_bytes, app_id=BOT_API_ID)
+        self_check_gogram_string(gstring)
+    except Exception as e:
+        return False, f"❌ Failed — {display_name}: couldn't encode Gogram string ({type(e).__name__})", None
+
+    return True, f"Converted {label} → Gogram\n`{gstring}`", None
+
+
+async def convert_pyrogram_to_gogram(display_name, out_dir, session_path_no_ext=None, session_string=None):
+    """Returns (ok, line, None) — gogram output is a string, not a file."""
+    try:
+        if session_path_no_ext:
+            dc_id, auth_key_bytes, user_id, is_bot = manual_pyrogram_session_read(session_path_no_ext + ".session")
+            label = f"id:{user_id}" if user_id else display_name
+            app_id = BOT_API_ID
+        else:
+            client = await get_authorized_pyrogram_client(session_string=session_string)
+            try:
+                me = await client.get_me()
+                label = phone_label(me)
+                dc_id = await client.storage.dc_id()
+                auth_key_bytes = await client.storage.auth_key()
+                try:
+                    app_id = await client.storage.api_id() or BOT_API_ID
+                except Exception:
+                    app_id = BOT_API_ID
+            finally:
+                await disconnect_quietly(client, "Pyrogram")
+    except Exception as e:
+        return False, f"❌ Failed — {display_name}: not a valid/authorized Pyrogram session ({type(e).__name__})", None
+
+    try:
+        gstring = encode_gogram_session_string(dc_id, auth_key_bytes, app_id=app_id)
+        self_check_gogram_string(gstring)
+    except Exception as e:
+        return False, f"❌ Failed — {display_name}: couldn't encode Gogram string ({type(e).__name__})", None
+
+    return True, f"Converted {label} → Gogram\n`{gstring}`", None
+
+
 async def convert_telethon_to_pyrogram(display_name, out_dir, session_path_no_ext=None, session_string=None):
     """Returns (ok, line, file_path_or_None)."""
     try:
@@ -359,7 +460,12 @@ async def process_and_report_convert(update: Update, direction, session_files, s
     shutil.rmtree(out_dir, ignore_errors=True)
     os.makedirs(out_dir, exist_ok=True)
 
-    convert_fn = convert_telethon_to_pyrogram if direction == MODE_CONV_T2P else convert_pyrogram_to_telethon
+    convert_fn = {
+        MODE_CONV_T2P: convert_telethon_to_pyrogram,
+        MODE_CONV_P2T: convert_pyrogram_to_telethon,
+        MODE_CONV_T2G: convert_telethon_to_gogram,
+        MODE_CONV_P2G: convert_pyrogram_to_gogram,
+    }[direction]
 
     success_count = 0
     fail_count = 0
@@ -1215,6 +1321,16 @@ EXPLAIN = {
         "Each one is converted into a Telethon-compatible *.session* file. "
         "One session → you get the file directly. Multiple → bundled into a zip."
     ),
+    "conv_t2g": (
+        "Send a Telethon session (zip / .session / .txt / pasted string).\n\n"
+        "Each one is converted into a *Gogram-compatible string session* — "
+        "sent back as text, ready to paste into a Go bot's `SESSION_STRING`."
+    ),
+    "conv_p2g": (
+        "Send a Pyrogram session (zip / .session / .txt / pasted string).\n\n"
+        "Each one is converted into a *Gogram-compatible string session* — "
+        "sent back as text, ready to paste into a Go bot's `SESSION_STRING`."
+    ),
 }
 EXPLAIN = {k: sc(v) for k, v in EXPLAIN.items()}
 
@@ -1295,6 +1411,8 @@ def changer_direction_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Telethon ➡️ Pyrogram", callback_data="convdir:t2p")],
         [InlineKeyboardButton("Pyrogram ➡️ Telethon", callback_data="convdir:p2t")],
+        [InlineKeyboardButton("Telethon ➡️ Gogram", callback_data="convdir:t2g")],
+        [InlineKeyboardButton("Pyrogram ➡️ Gogram", callback_data="convdir:p2g")],
         back_row("backmenu"),
     ])
 
@@ -1354,7 +1472,9 @@ HELP_TEXT = (
     f"*🔄 {sc('Session Changer')}*\n"
     f"{EXPLAIN['changer']}\n"
     f"  • {sc('Telethon ➡️ Pyrogram')} — {EXPLAIN['conv_t2p']}\n"
-    f"  • {sc('Pyrogram ➡️ Telethon')} — {EXPLAIN['conv_p2t']}\n\n"
+    f"  • {sc('Pyrogram ➡️ Telethon')} — {EXPLAIN['conv_p2t']}\n"
+    f"  • {sc('Telethon ➡️ Gogram')} — {EXPLAIN['conv_t2g']}\n"
+    f"  • {sc('Pyrogram ➡️ Gogram')} — {EXPLAIN['conv_p2g']}\n\n"
     f"*⚠️ {sc('OTP tip')}*\n"
     f"{OTP_TIP}\n\n"
     f"*{sc('Commands')}*\n"
@@ -1502,10 +1622,15 @@ async def on_changer_direction_chosen(update: Update, context: ContextTypes.DEFA
         )
         return
 
-    mode = MODE_CONV_T2P if direction == "t2p" else MODE_CONV_P2T
+    mode_map = {
+        "t2p": (MODE_CONV_T2P, "Telethon ➡️ Pyrogram"),
+        "p2t": (MODE_CONV_P2T, "Pyrogram ➡️ Telethon"),
+        "t2g": (MODE_CONV_T2G, "Telethon ➡️ Gogram"),
+        "p2g": (MODE_CONV_P2G, "Pyrogram ➡️ Gogram"),
+    }
+    mode, title = mode_map[direction]
     context.user_data.clear()
     context.user_data["mode"] = mode
-    title = "Telethon ➡️ Pyrogram" if mode == MODE_CONV_T2P else "Pyrogram ➡️ Telethon"
     await query.edit_message_text(
         f"{banner(title)}\n{EXPLAIN[mode]}\n\n{INPUT_HINT}",
         reply_markup=InlineKeyboardMarkup([back_row("convdir:back")]),
@@ -1585,7 +1710,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if mode in (MODE_CONV_T2P, MODE_CONV_P2T):
+    if mode in (MODE_CONV_T2P, MODE_CONV_P2T, MODE_CONV_T2G, MODE_CONV_P2G):
         await process_and_report_convert(update, mode, session_files, string_entries)
     else:
         await process_and_report(update, mode, session_files, string_entries)
@@ -1614,7 +1739,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not lines:
         return
     string_entries = [(line, f"pasted line {i+1}") for i, line in enumerate(lines)]
-    if mode in (MODE_CONV_T2P, MODE_CONV_P2T):
+    if mode in (MODE_CONV_T2P, MODE_CONV_P2T, MODE_CONV_T2G, MODE_CONV_P2G):
         await process_and_report_convert(update, mode, [], string_entries)
     else:
         await process_and_report(update, mode, [], string_entries)

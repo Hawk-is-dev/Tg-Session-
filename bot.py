@@ -1771,6 +1771,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     log.info("Session Control Center bot starting...")
+    from keepalive import keep_alive
+    keep_alive()
     app.run_polling()
 
 

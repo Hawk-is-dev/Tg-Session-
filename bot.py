@@ -127,15 +127,56 @@ def _scify(value):
     return sc_safe(value) if isinstance(value, str) else value
 
 
+# Escape legacy-Markdown special characters in dynamic/user-supplied text
+# (names, usernames, etc.) before it gets interpolated into a parse_mode=
+# "Markdown" message. Without this, an unbalanced "_", "*", "[", "`" etc.
+# coming from Telegram (e.g. someone's first_name or @username) makes
+# Telegram reject the whole message with "Can't parse entities" and crashes
+# the handler.
+_MD_ESCAPE_RE = re.compile(r"([_*\[\]()`])")
+
+
+def md_escape(text) -> str:
+    """Escape Telegram legacy-Markdown special chars in untrusted/dynamic text."""
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    return _MD_ESCAPE_RE.sub(r"\\\1", text)
+
+
 _orig_msg_reply_text = Message.reply_text
 _orig_msg_reply_document = Message.reply_document
 _orig_cbq_edit_message_text = CallbackQuery.edit_message_text
 _orig_bot_send_message = Bot.send_message
 _orig_bot_send_document = Bot.send_document
 
+try:
+    from telegram.error import BadRequest as _TgBadRequest
+except Exception:  # pragma: no cover - defensive, telegram always has this
+    _TgBadRequest = None
+
+
+def _is_entity_parse_error(exc) -> bool:
+    return _TgBadRequest is not None and isinstance(exc, _TgBadRequest) and "parse entities" in str(exc).lower()
+
+
+async def _send_with_markdown_fallback(fn, *args, **kwargs):
+    """Call fn(*args, **kwargs); if Telegram rejects it for unbalanced
+    Markdown entities, retry once with parse_mode stripped instead of
+    letting the handler crash (which otherwise kills the whole update)."""
+    try:
+        return await fn(*args, **kwargs)
+    except Exception as e:
+        if _is_entity_parse_error(e) and kwargs.get("parse_mode"):
+            log.warning("Markdown parse error, retrying without parse_mode: %s", e)
+            kwargs = {**kwargs, "parse_mode": None}
+            return await fn(*args, **kwargs)
+        raise
+
 
 async def _patched_msg_reply_text(self, text=None, *args, **kwargs):
-    return await _orig_msg_reply_text(self, _scify(text), *args, **kwargs)
+    return await _send_with_markdown_fallback(_orig_msg_reply_text, self, _scify(text), *args, **kwargs)
 
 
 async def _patched_msg_reply_document(self, *args, caption=None, **kwargs):
@@ -143,11 +184,11 @@ async def _patched_msg_reply_document(self, *args, caption=None, **kwargs):
 
 
 async def _patched_cbq_edit_message_text(self, text=None, *args, **kwargs):
-    return await _orig_cbq_edit_message_text(self, _scify(text), *args, **kwargs)
+    return await _send_with_markdown_fallback(_orig_cbq_edit_message_text, self, _scify(text), *args, **kwargs)
 
 
 async def _patched_bot_send_message(self, chat_id, text=None, *args, **kwargs):
-    return await _orig_bot_send_message(self, chat_id, _scify(text), *args, **kwargs)
+    return await _send_with_markdown_fallback(_orig_bot_send_message, self, chat_id, _scify(text), *args, **kwargs)
 
 
 async def _patched_bot_send_document(self, chat_id, *args, caption=None, **kwargs):
@@ -1040,7 +1081,7 @@ async def finish_single_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = flow["client"]
 
     me = await client.get_me()
-    label = getattr(me, "username", None) or getattr(me, "id", "unknown")
+    label = md_escape(getattr(me, "username", None) or getattr(me, "id", "unknown"))
 
     if kind == "string":
         if fmt == "pyrogram":
@@ -1434,7 +1475,7 @@ START_FOOTER = (
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    first_name = update.effective_user.first_name or "there"
+    first_name = md_escape(update.effective_user.first_name or "there")
     await update.message.reply_text(
         f"{banner('Session Control Center')}\n"
         f"{sc(f'Welcome, {first_name}.')}\n"

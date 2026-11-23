@@ -66,6 +66,58 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 BOT_API_ID = int(os.environ["API_ID"])
 BOT_API_HASH = os.environ["API_HASH"]
 
+# Device fingerprint — sent to Telegram on every connection (initConnection),
+# for both Telethon and Pyrogram, for Generate Session AND for every later
+# connection this bot makes. A realistic phone profile instead of the library
+# defaults (which show the server: "PC 64bit" / "CPython 3.x"). Override any of
+# these with env variables; the defaults need no setup.
+DEVICE_MODEL = os.environ.get("DEVICE_MODEL", "Samsung SM-S918B")
+SYSTEM_VERSION = os.environ.get("SYSTEM_VERSION", "SDK 34")
+APP_VERSION = os.environ.get("APP_VERSION", "10.14.5")
+LANG_CODE = os.environ.get("LANG_CODE", "en")
+SYSTEM_LANG_CODE = os.environ.get("SYSTEM_LANG_CODE", "en-US")
+
+def describe_sent_code_channel(sent) -> str:
+    """send_code_request()/send_code() succeeding only means Telegram ACCEPTED
+    the request — it does NOT mean the code shows up inside the Telegram app.
+    Telegram itself decides the delivery channel (app message / SMS / voice
+    call / flash call / email), based on things like whether another session
+    is already active on that number. This turns that decision into something
+    a human can act on, for both Telethon (class-based .type) and Pyrogram
+    (enum-based .type)."""
+    raw = getattr(sent, "type", None)
+    if raw is None:
+        return "an unknown channel"
+    name = getattr(raw, "name", None) or type(raw).__name__
+    key = name.upper().replace("SENTCODETYPE", "").replace("_", "")
+    if "FLASH" in key:
+        return "a flash/missed call — Telegram reads the code off the incoming caller ID, the number needs real call reception"
+    if "MISSED" in key:
+        return "a missed call — the number needs real call reception"
+    if "SETUP" in key:
+        return "a recovery email that first needs to be set up — this number has no code delivery method yet"
+    if "EMAIL" in key:
+        return "the account's recovery email, not the Telegram app or SMS"
+    if "FRAGMENT" in key:
+        return "Fragment (fragment.com), not a normal SMS"
+    if "CALL" in key:
+        return "a VOICE CALL reading out the code — the number needs to be able to receive calls, not just SMS"
+    if "SMS" in key:
+        return "a real SMS text to this number"
+    if "APP" in key:
+        return "inside the Telegram app itself (only happens when another session is already active on this number)"
+    return f"an unrecognized channel ({name})"
+
+
+TELETHON_DEVICE = dict(
+    device_model=DEVICE_MODEL, system_version=SYSTEM_VERSION, app_version=APP_VERSION,
+    lang_code=LANG_CODE, system_lang_code=SYSTEM_LANG_CODE,
+)
+PYRO_DEVICE = dict(
+    device_model=DEVICE_MODEL, system_version=SYSTEM_VERSION, app_version=APP_VERSION,
+    lang_code=LANG_CODE,
+)
+
 WORK_DIR = "work"
 
 MODE_DESTROYER = "destroyer"
@@ -566,16 +618,16 @@ async def process_and_report_convert(update: Update, direction, session_files, s
 
 async def get_authorized_telethon_client(session_path_no_ext=None, session_string=None):
     if session_string:
-        client = TelethonClient(TelethonStringSession(session_string), BOT_API_ID, BOT_API_HASH)
+        client = TelethonClient(TelethonStringSession(session_string), BOT_API_ID, BOT_API_HASH, **TELETHON_DEVICE)
         await client.connect()
     else:
         session_file_path = session_path_no_ext + ".session"
         try:
-            client = TelethonClient(session_path_no_ext, BOT_API_ID, BOT_API_HASH)
+            client = TelethonClient(session_path_no_ext, BOT_API_ID, BOT_API_HASH, **TELETHON_DEVICE)
             await client.connect()
         except Exception:
             manual_session = manual_telethon_session_from_sqlite(session_file_path)
-            client = TelethonClient(manual_session, BOT_API_ID, BOT_API_HASH)
+            client = TelethonClient(manual_session, BOT_API_ID, BOT_API_HASH, **TELETHON_DEVICE)
             await client.connect()
 
     if not await client.is_user_authorized():
@@ -591,12 +643,12 @@ async def get_authorized_pyrogram_client(session_path_no_ext=None, session_strin
     if session_string:
         client = PyroClient(
             name="mem", api_id=BOT_API_ID, api_hash=BOT_API_HASH,
-            session_string=session_string, in_memory=True,
+            session_string=session_string, in_memory=True, **PYRO_DEVICE,
         )
     else:
         workdir = os.path.dirname(session_path_no_ext) or "."
         name = os.path.basename(session_path_no_ext)
-        client = PyroClient(name=name, api_id=BOT_API_ID, api_hash=BOT_API_HASH, workdir=workdir)
+        client = PyroClient(name=name, api_id=BOT_API_ID, api_hash=BOT_API_HASH, workdir=workdir, **PYRO_DEVICE)
 
     await client.connect()
     try:
@@ -1013,19 +1065,19 @@ async def handle_single_gen_text(update: Update, context: ContextTypes.DEFAULT_T
         api_id, api_hash = flow["api_id"], flow["api_hash"]
         try:
             if kind == "string" and fmt == "pyrogram":
-                client = PyroClient(name="mem", api_id=api_id, api_hash=api_hash, in_memory=True)
+                client = PyroClient(name="mem", api_id=api_id, api_hash=api_hash, in_memory=True, **PYRO_DEVICE)
                 await client.connect()
                 sent = await client.send_code(phone)
                 phone_code_hash = sent.phone_code_hash
             elif kind == "file":
                 gen_dir = await gen_dir_for(update)
                 file_path = os.path.join(gen_dir, safe_phone(phone))
-                client = TelethonClient(file_path, api_id, api_hash)
+                client = TelethonClient(file_path, api_id, api_hash, **TELETHON_DEVICE)
                 await client.connect()
                 sent = await client.send_code_request(phone)
                 phone_code_hash = sent.phone_code_hash
             else:  # string + telethon
-                client = TelethonClient(TelethonStringSession(), api_id, api_hash)
+                client = TelethonClient(TelethonStringSession(), api_id, api_hash, **TELETHON_DEVICE)
                 await client.connect()
                 sent = await client.send_code_request(phone)
                 phone_code_hash = sent.phone_code_hash
@@ -1034,8 +1086,13 @@ async def handle_single_gen_text(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         flow.update({"phone": phone, "client": client, "phone_code_hash": phone_code_hash, "step": "otp"})
+        channel = describe_sent_code_channel(sent)
         await update.message.reply_text(
-            f"{banner('Step 3 / 3 — Verification Code')}\n📩 Code sent. Enter it here.",
+            f"{banner('Step 3 / 3 — Verification Code')}\n"
+            f"📩 Telegram accepted the request. It will deliver the code via:\n"
+            f"👉 {channel}\n\n"
+            f"If nothing arrives in a minute, this number likely can't receive that channel "
+            f"(e.g. SMS-only number, but Telegram chose a voice call). Enter the code here once you get it.",
             parse_mode="Markdown",
         )
         return
@@ -1180,7 +1237,7 @@ async def zip_send_code_for_current(update: Update, context: ContextTypes.DEFAUL
 
     client = None
     try:
-        client = TelethonClient(file_path, api_id, api_hash)
+        client = TelethonClient(file_path, api_id, api_hash, **TELETHON_DEVICE)
         await client.connect()
         sent = await client.send_code_request(phone)
     except Exception as e:
@@ -1204,7 +1261,11 @@ async def zip_send_code_for_current(update: Update, context: ContextTypes.DEFAUL
     flow["client"] = client
     flow["phone_code_hash"] = sent.phone_code_hash
     flow["step"] = "zip_otp"
-    await update.message.reply_text(f"📩 [{i+1}/{len(flow['phones'])}] Code sent to {phone}. Enter it:")
+    channel = describe_sent_code_channel(sent)
+    await update.message.reply_text(
+        f"📩 [{i+1}/{len(flow['phones'])}] {phone} — Telegram will deliver the code via: {channel}\n"
+        f"Enter it once you get it."
+    )
 
 
 async def zip_handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_otp: str):
